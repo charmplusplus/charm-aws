@@ -9,12 +9,12 @@ import json
 from datetime import datetime, timedelta
 
 
-class CharmAWSManager:
+class CharmCloudManager:
     """A class to launch and manage AWS EC2 instances for Charm++ applications."""
     
     def __init__(self, key_path, region_name='us-east-1'):
         """
-        Initialize the CharmAWSManager.
+        Initialize the CharmCloudManager.
         
         Args:
             region_name (str): AWS region to use (default: 'us-east-1')
@@ -746,7 +746,7 @@ class CharmAWSManager:
                 new_active_instances.append(instance)
         self.active_instances = new_active_instances + new_instances
     
-    async def monitor_instances(self, fleet_id, timeout=10):
+    async def monitor_instances(self, fleet_id, timeout=10, setup_command=None):
         while True:
             instance_ids = [instance['instance_id'] for instance in self.active_instances]
             num_interruptions, self.interrupted_instances = await self.check_interruptions(
@@ -756,6 +756,15 @@ class CharmAWSManager:
             # send signal to application to shrink/expand
             if num_interruptions > 0 or len(new_instances) > 0:
                 print("ACTIVE INSTANCES: ", len(self.active_instances))
+
+                if setup_command and new_instances:
+                    setup_tasks = []
+                    for instance in new_instances:
+                        setup_tasks.append(
+                            asyncio.create_task(self.run_command(setup_command, instance['public_dns']))
+                        )
+                    await asyncio.gather(*setup_tasks)
+
                 master = await self.update_nodelist_file(
                     self.interrupted_instances, new_instances, "/tmp/nodelist"
                     )
@@ -770,6 +779,7 @@ class CharmAWSManager:
             instance_types,
             cluster_name,
             command,
+            setup_command=None,
             total_target_capacity=3,
             on_demand_count=1,  # One on-demand, rest spot
             key_name=None,
@@ -826,7 +836,7 @@ class CharmAWSManager:
             total_target_capacity=total_target_capacity,
             on_demand_count=on_demand_count,
             instance_types=instance_types,
-            spot_allocation_strategy='lowest-price',
+            spot_allocation_strategy='price-capacity-optimized',
             fleet_type='maintain',
             subnet_ids=subnet_ids
         )
@@ -837,6 +847,15 @@ class CharmAWSManager:
 
         num_pes = sum([i['vcpus'] for i in self.active_instances])
         command = command % {'num_pes': num_pes}
+
+        # Run setup_command on all active instances if provided
+        if setup_command:
+            setup_tasks = []
+            for instance in self.active_instances:
+                setup_tasks.append(
+                    asyncio.create_task(self.run_command(setup_command, instance['public_dns']))
+                )
+            await asyncio.gather(*setup_tasks)
 
         # run the charmrun command on master node
         run_task = asyncio.create_task(self.run_command(command, master['public_dns'], output_file=output_file))
@@ -865,6 +884,7 @@ class CharmAWSManager:
             instance_types,
             cluster_name,
             command,
+            setup_command=None,
             total_target_capacity=3,
             on_demand_count=1,  # One on-demand, rest spot
             key_name=None,
@@ -878,6 +898,7 @@ class CharmAWSManager:
             instance_types=instance_types,
             cluster_name=cluster_name,
             command=command,
+            setup_command=setup_command,
             total_target_capacity=total_target_capacity,
             on_demand_count=on_demand_count,
             key_name=key_name,
