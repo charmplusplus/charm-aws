@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 class CharmCloudManager:
     """A class to launch and manage AWS EC2 instances for Charm++ applications."""
     
-    def __init__(self, key_path, region_name='us-east-1'):
+    def __init__(self, key_path, region_name='us-east-2'):
         """
         Initialize the CharmCloudManager.
         
@@ -127,17 +127,17 @@ class CharmCloudManager:
             iam_client = boto3.client('iam', region_name=self.region_name)
             try:
                 instance_profile = iam_client.create_instance_profile(
-                    InstanceProfileName='charm-instance-profile'
+                    InstanceProfileName='charm-instance-profile2'
                 )
 
                 # Attach role to instance profile
                 iam_client.add_role_to_instance_profile(
-                    InstanceProfileName='charm-instance-profile',
+                    InstanceProfileName='charm-instance-profile2',
                     RoleName='ec2-hpc'  # Use your existing role name
                 )
 
                 launch_template_data['IamInstanceProfile'] = {
-                    'Name': 'charm-instance-profile'
+                    'Name': 'charm-instance-profile2'
                 }
             except:
                 print("Instance profile already exists or role is already attached")
@@ -211,14 +211,10 @@ class CharmCloudManager:
         launch_template_configs = []
         
         if instance_types:
-            # Create overrides for each instance type
-            overrides = []
-            # for instance_type in instance_types:
-            #     override = {'InstanceType': instance_type}
-            #     if subnet_ids and len(subnet_ids) == 1:
-            #         override['SubnetId'] = subnet_ids[0]
-            #     overrides.append(override)
-                
+            # When using vCPU capacity, we need to use InstanceRequirements
+            # Find the max vCPUs from your instance types to set proper limits
+            max_vcpus = 128  # c5.metal and c5d.metal have 96 vCPUs, c5.24xlarge has 96
+            
             launch_template_config = {
                 'LaunchTemplateSpecification': {
                     'LaunchTemplateId': launch_template_id,
@@ -226,23 +222,23 @@ class CharmCloudManager:
                 },
                 'Overrides': [{
                     "SubnetId": subnet_ids[0] if subnet_ids else None,
-                    "InstanceRequirements": {  # REQUIRED
-                        "VCpuCount": { "Min": 1, "Max": 8 },
+                    "InstanceRequirements": {  # REQUIRED when using vCPU capacity
+                        "VCpuCount": { "Min": 2, "Max": max_vcpus },
                         "MemoryMiB": { "Min": 2048 },
                         "AllowedInstanceTypes": instance_types
                     }
-                }] + overrides
+                }]
             }
         else:
-            # No instance type overrides
+            # No instance type overrides - use broader requirements
             launch_template_config = {
                 'LaunchTemplateSpecification': {
                     'LaunchTemplateId': launch_template_id,
                     'Version': '$Latest'
                 },
                 "Overrides": [{
-                    "InstanceRequirements": {  # REQUIRED
-                        "VCpuCount": { "Min": 2, "Max": 8 },
+                    "InstanceRequirements": {  # REQUIRED when using vCPU capacity
+                        "VCpuCount": { "Min": 2, "Max": 128 },
                         "MemoryMiB": { "Min": 2048 },
                     }
                 }]
@@ -250,10 +246,15 @@ class CharmCloudManager:
             
             # Add subnet overrides if multiple subnets specified
             if subnet_ids and len(subnet_ids) > 1:
-                overrides = []
                 for subnet_id in subnet_ids:
-                    overrides.append({'SubnetId': subnet_id})
-                launch_template_config['Overrides'] += overrides
+                    additional_override = {
+                        "SubnetId": subnet_id,
+                        "InstanceRequirements": {
+                            "VCpuCount": { "Min": 2, "Max": 128 },
+                            "MemoryMiB": { "Min": 2048 },
+                        }
+                    }
+                    launch_template_config['Overrides'].append(additional_override)
         
         launch_template_configs.append(launch_template_config)
         
@@ -274,14 +275,14 @@ class CharmCloudManager:
         # Add spot options
         if spot_count > 0:
             fleet_specs['SpotOptions'] = {
-                'AllocationStrategy': spot_allocation_strategy,
+                'AllocationStrategy': 'price-capacity-optimized',  # Better for price per vCPU
                 'InstanceInterruptionBehavior': 'terminate'
             }
         
         # Add on-demand options
         if on_demand_count > 0:
             fleet_specs['OnDemandOptions'] = {
-                'AllocationStrategy': 'lowest-price'
+                'AllocationStrategy': 'lowest-price'  # Optimizes for lowest price per vCPU
             }
         
         try:
@@ -451,6 +452,13 @@ class CharmCloudManager:
             for instance in instances_info['detailed_instances']:
                 instance['vcpus'] = vcpus_map.get(instance['instance_type'], -1)
 
+            # Calculate and print total cost per hour
+            # total_cost_per_hour = self.calculate_fleet_cost(instances_info['detailed_instances'])
+            # print(f"\n💰 Fleet Cost Summary:")
+            # print(f"Total cost per hour: ${total_cost_per_hour:.4f}")
+            # print(f"Estimated cost per day: ${total_cost_per_hour * 24:.2f}")
+            # print(f"Estimated cost per month (30 days): ${total_cost_per_hour * 24 * 30:.2f}")
+
             self.active_instances = instances_info['detailed_instances']  # Save active instances
 
             return fleet_id
@@ -488,6 +496,244 @@ class CharmCloudManager:
         
         return instance_vcpus
     
+    def get_instance_pricing(self, instance_types, region='us-east-2'):
+        """
+        Get on-demand and spot pricing for instance types using AWS Pricing API.
+        
+        Args:
+            instance_types (list): List of EC2 instance types
+            region (str): AWS region
+            
+        Returns:
+            dict: Mapping of instance type to pricing information
+        """
+        # Create Pricing client (must use us-east-1 region)
+        pricing = boto3.client('pricing', region_name='us-east-1')
+        
+        # Map region codes to pricing API location names
+        region_map = {
+            'us-east-1': 'US East (N. Virginia)',
+            'us-east-2': 'US East (Ohio)',
+            'us-west-1': 'US West (N. California)',
+            'us-west-2': 'US West (Oregon)',
+            'eu-west-1': 'Europe (Ireland)',
+            'eu-central-1': 'Europe (Frankfurt)',
+            'ap-southeast-1': 'Asia Pacific (Singapore)',
+            'ap-northeast-1': 'Asia Pacific (Tokyo)',
+        }
+        
+        location = region_map.get(region, 'US East (Ohio)')
+        pricing_info = {}
+        
+        for instance_type in instance_types:
+            try:
+                # Get on-demand pricing
+                response = pricing.get_products(
+                    ServiceCode='AmazonEC2',
+                    Filters=[
+                        {'Type': 'TERM_MATCH', 'Field': 'instanceType', 'Value': instance_type},
+                        {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': location},
+                        {'Type': 'TERM_MATCH', 'Field': 'tenancy', 'Value': 'Shared'},
+                        {'Type': 'TERM_MATCH', 'Field': 'operating-system', 'Value': 'Linux'},
+                        {'Type': 'TERM_MATCH', 'Field': 'preInstalledSw', 'Value': 'NA'}
+                    ]
+                )
+                
+                ondemand_price = None
+                for price_item in response['PriceList']:
+                    price_data = json.loads(price_item)
+                    terms = price_data['terms']['OnDemand']
+                    for term_key, term_value in terms.items():
+                        price_dimensions = term_value['priceDimensions']
+                        for dimension_key, dimension_value in price_dimensions.items():
+                            ondemand_price = float(dimension_value['pricePerUnit']['USD'])
+                            break
+                        if ondemand_price:
+                            break
+                    if ondemand_price:
+                        break
+                
+                pricing_info[instance_type] = {
+                    'ondemand': ondemand_price or 0.0
+                }
+                
+            except Exception as e:
+                print(f"Warning: Could not fetch pricing for {instance_type}: {e}")
+                # Fallback prices (approximate)
+                fallback_prices = {
+                    'c5.large': 0.085,
+                    'c5.xlarge': 0.17,
+                    'c5.2xlarge': 0.34,
+                    'c5.4xlarge': 0.68,
+                    'c4.large': 0.1,
+                    'c4.xlarge': 0.199,
+                    'c5a.large': 0.077,
+                    'c5a.xlarge': 0.154,
+                    'm5.large': 0.096,
+                    'm5.xlarge': 0.192,
+                }
+                pricing_info[instance_type] = {
+                    'ondemand': fallback_prices.get(instance_type, 0.1)
+                }
+        
+        return pricing_info
+    
+    def get_current_spot_prices(self, instance_types):
+        """
+        Get current spot prices for instance types in the region.
+        
+        Args:
+            instance_types (list): List of EC2 instance types
+            
+        Returns:
+            dict: Mapping of instance type to current spot price
+        """
+        ec2_client = boto3.client('ec2', region_name=self.region_name)
+        spot_prices = {}
+        
+        try:
+            # Get availability zones in the region
+            az_response = ec2_client.describe_availability_zones()
+            availability_zones = [az['ZoneName'] for az in az_response['AvailabilityZones']]
+            
+            for instance_type in instance_types:
+                zone_prices = []
+                for az in availability_zones:
+                    try:
+                        response = ec2_client.describe_spot_price_history(
+                            InstanceTypes=[instance_type],
+                            AvailabilityZone=az,
+                            ProductDescriptions=['Linux/UNIX (Amazon VPC)'],
+                            MaxResults=1  # Get only the most recent price
+                        )
+                        
+                        if response['SpotPriceHistory']:
+                            price = float(response['SpotPriceHistory'][0]['SpotPrice'])
+                            zone_prices.append(price)
+                    except Exception as e:
+                        print(f"Warning: Could not get spot price for {instance_type} in {az}: {e}")
+                
+                if zone_prices:
+                    # Use the average spot price across all AZs
+                    avg_spot_price = sum(zone_prices) / len(zone_prices)
+                    spot_prices[instance_type] = avg_spot_price
+                else:
+                    print(f"Warning: No spot price found for {instance_type}, using fallback")
+                    spot_prices[instance_type] = None
+        
+        except Exception as e:
+            print(f"Error fetching spot prices: {e}")
+        
+        return spot_prices
+    
+    def get_spot_price_for_instance(self, instance_type, availability_zone):
+        """
+        Get the current spot price for a specific instance type in a specific AZ.
+        
+        Args:
+            instance_type (str): EC2 instance type
+            availability_zone (str): Availability zone
+            
+        Returns:
+            float: Current spot price, or None if unavailable
+        """
+        ec2_client = boto3.client('ec2', region_name=self.region_name)
+        
+        try:
+            response = ec2_client.describe_spot_price_history(
+                InstanceTypes=[instance_type],
+                AvailabilityZone=availability_zone,
+                ProductDescriptions=['Linux/UNIX (Amazon VPC)'],
+                MaxResults=1  # Get only the most recent price
+            )
+            
+            if response['SpotPriceHistory']:
+                return float(response['SpotPriceHistory'][0]['SpotPrice'])
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"Error fetching spot price for {instance_type} in {availability_zone}: {e}")
+            return None
+    
+    def calculate_fleet_cost(self, instances):
+        """
+        Calculate the total cost per hour for the fleet using actual spot prices.
+        
+        Args:
+            instances (list): List of instance information dictionaries
+            
+        Returns:
+            float: Total cost per hour in USD
+        """
+        # Get unique instance types
+        instance_types = list(set([instance['instance_type'] for instance in instances]))
+        
+        # Get pricing information
+        pricing_info = self.get_instance_pricing(instance_types, self.region_name)
+        spot_prices = self.get_current_spot_prices(instance_types)
+        
+        total_cost = 0.0
+        cost_breakdown = {}
+        
+        for instance in instances:
+            instance_type = instance['instance_type']
+            lifecycle = instance['lifecycle']
+            availability_zone = instance.get('availability_zone', 'N/A')
+            
+            if instance_type in pricing_info:
+                ondemand_price = pricing_info[instance_type]['ondemand']
+                
+                if lifecycle == 'spot':
+                    # Try to get AZ-specific spot price first
+                    if availability_zone != 'N/A':
+                        az_spot_price = self.get_spot_price_for_instance(instance_type, availability_zone)
+                        if az_spot_price is not None:
+                            instance_cost = az_spot_price
+                            savings_pct = ((ondemand_price - az_spot_price) / ondemand_price) * 100
+                            cost_type = f"{instance_type} (spot-{availability_zone}) [{savings_pct:.1f}% savings]"
+                        else:
+                            # Fall back to region average
+                            if instance_type in spot_prices and spot_prices[instance_type] is not None:
+                                actual_spot_price = spot_prices[instance_type]
+                                instance_cost = actual_spot_price
+                                savings_pct = ((ondemand_price - actual_spot_price) / ondemand_price) * 100
+                                cost_type = f"{instance_type} (spot-avg) [{savings_pct:.1f}% savings]"
+                            else:
+                                # Final fallback to estimate
+                                estimated_spot_price = ondemand_price * 0.7
+                                instance_cost = estimated_spot_price
+                                cost_type = f"{instance_type} (spot-estimated)"
+                    else:
+                        # Use region average if AZ not available
+                        if instance_type in spot_prices and spot_prices[instance_type] is not None:
+                            actual_spot_price = spot_prices[instance_type]
+                            instance_cost = actual_spot_price
+                            savings_pct = ((ondemand_price - actual_spot_price) / ondemand_price) * 100
+                            cost_type = f"{instance_type} (spot-avg) [{savings_pct:.1f}% savings]"
+                        else:
+                            # Fallback to estimate
+                            estimated_spot_price = ondemand_price * 0.7
+                            instance_cost = estimated_spot_price
+                            cost_type = f"{instance_type} (spot-estimated)"
+                else:
+                    instance_cost = ondemand_price
+                    cost_type = f"{instance_type} (on-demand)"
+                
+                total_cost += instance_cost
+                
+                if cost_type not in cost_breakdown:
+                    cost_breakdown[cost_type] = {'count': 0, 'unit_cost': instance_cost, 'total_cost': 0}
+                cost_breakdown[cost_type]['count'] += 1
+                cost_breakdown[cost_type]['total_cost'] += instance_cost
+        
+        # Print detailed breakdown
+        print(f"\n📊 Cost Breakdown (Actual Spot Prices):")
+        for cost_type, details in cost_breakdown.items():
+            print(f"  {cost_type}: {details['count']}x @ ${details['unit_cost']:.4f}/hr = ${details['total_cost']:.4f}/hr")
+        
+        return total_cost
+    
     async def write_nodelist_file(self, filename):
         """
         Write a nodelist file for Charm++ to an instance.
@@ -504,12 +750,12 @@ class CharmCloudManager:
             if instance['lifecycle'] == 'on-demand':
                 master = instance
                 nodelist_str = (
-                    f"host {instance['private_dns']} ++cpus {instance['vcpus']}\n" 
+                    f"{instance['private_dns']} slots={instance['vcpus']}\n" 
                     + nodelist_str
                 )
                 updated_instances = [instance] + updated_instances  # Master first
             else:
-                nodelist_str += f"host {instance['private_dns']} ++cpus {instance['vcpus']}\n"
+                nodelist_str += f"{instance['private_dns']} slots={instance['vcpus']}\n"
                 updated_instances.append(instance)
 
         self.active_instances = updated_instances
@@ -528,10 +774,10 @@ class CharmCloudManager:
         for instance in self.active_instances:
             if not instance['instance_id'] in interrupted_instances:
                 #new_active_instances.append(instance)
-                nodelist_str += f"host {instance['private_dns']} ++cpus {instance['vcpus']}\n"
+                nodelist_str += f"{instance['private_dns']} slots={instance['vcpus']}\n"
 
         for instance in new_instances:
-            nodelist_str += f"host {instance['private_dns']} ++cpus {instance['vcpus']}\n"
+            nodelist_str += f"{instance['private_dns']} slots={instance['vcpus']}\n"
 
         #self.active_instances = new_active_instances
         master = self.active_instances[0]
@@ -745,6 +991,14 @@ class CharmCloudManager:
             if instance['instance_id'] not in interrupted_instances:
                 new_active_instances.append(instance)
         self.active_instances = new_active_instances + new_instances
+        
+        # # Recalculate and print updated cost
+        # if len(new_instances) > 0:
+        #     total_cost_per_hour = self.calculate_fleet_cost(self.active_instances)
+        #     print(f"\n💰 Updated Fleet Cost After Replacement:")
+        #     print(f"Total cost per hour: ${total_cost_per_hour:.4f}")
+        #     print(f"Active instances: {len(self.active_instances)}")
+        #     print(f"Total vCPUs: {sum([i['vcpus'] for i in self.active_instances])}")
     
     async def monitor_instances(self, fleet_id, timeout=10, setup_command=None):
         while True:
@@ -778,7 +1032,7 @@ class CharmCloudManager:
             ami_id,
             instance_types,
             cluster_name,
-            command,
+            commands,
             setup_command=None,
             total_target_capacity=3,
             on_demand_count=1,  # One on-demand, rest spot
@@ -795,7 +1049,7 @@ class CharmCloudManager:
             ami_id (str): AMI ID to use
             instance_types (list): List of instance types to consider
             cluster_name (str): Base name for the cluster resources
-            command (str): Command to run on the master node
+            commands (list): List of commands to run on the master node
             total_target_capacity (int): Total number of instances to launch
             on_demand_count (int): Number of on-demand instances (rest will be spot)
             key_name (str): SSH key pair name
@@ -809,6 +1063,13 @@ class CharmCloudManager:
         self.create_placement_group(placement_group_name, strategy='cluster')
         
         # Create a launch template with the placement group
+        efa_network_interface = {
+            'DeviceIndex': 0,
+            'InterfaceType': 'efa',
+            'SubnetId': subnet_ids[0],  # Use your subnet
+            'Groups': security_group_ids,  # Use your security groups
+            # Optionally, set 'AssociatePublicIpAddress': True
+        }
         template_name = f"{cluster_name}-template-cluster"
         template_id = self.create_launch_template(
             template_name=template_name,
@@ -827,7 +1088,8 @@ class CharmCloudManager:
                     'Key': 'Cluster',
                     'Value': cluster_name
                 }
-            ]
+            ],
+            #network_interfaces=[efa_network_interface]
         )
         
         # Launch the EC2 fleet with mixed instance types
@@ -836,7 +1098,7 @@ class CharmCloudManager:
             total_target_capacity=total_target_capacity,
             on_demand_count=on_demand_count,
             instance_types=instance_types,
-            spot_allocation_strategy='price-capacity-optimized',
+            spot_allocation_strategy='price-capacity-optimized',  # Best for price per vCPU
             fleet_type='maintain',
             subnet_ids=subnet_ids
         )
@@ -845,29 +1107,31 @@ class CharmCloudManager:
 
         master = await self.write_nodelist_file('/tmp/nodelist')
 
-        num_pes = sum([i['vcpus'] for i in self.active_instances])
-        command = command % {'num_pes': num_pes}
+        for i, command in enumerate(commands):
+            num_pes = sum([i['vcpus'] for i in self.active_instances])
+            command = command % {'num_pes': num_pes}
 
-        # Run setup_command on all active instances if provided
-        if setup_command:
-            setup_tasks = []
-            for instance in self.active_instances:
-                setup_tasks.append(
-                    asyncio.create_task(self.run_command(setup_command, instance['public_dns']))
+            # Run setup_command on all active instances if provided
+            if setup_command:
+                setup_tasks = []
+                for instance in self.active_instances:
+                    setup_tasks.append(
+                        asyncio.create_task(self.run_command(setup_command, instance['public_dns']))
+                    )
+                await asyncio.gather(*setup_tasks)
+
+            # run the charmrun command on master node
+            run_task = asyncio.create_task(self.run_command(command, master['public_dns'], 
+                                                            output_file=f"{output_file}_{i}"))
+            monitor_task = asyncio.create_task(
+                self.monitor_instances(
+                    fleet_id,
+                    timeout=10  # Poll every 10 seconds
                 )
-            await asyncio.gather(*setup_tasks)
-
-        # run the charmrun command on master node
-        run_task = asyncio.create_task(self.run_command(command, master['public_dns'], output_file=output_file))
-        monitor_task = asyncio.create_task(
-            self.monitor_instances(
-                fleet_id,
-                timeout=10  # Poll every 10 seconds
             )
-        )
 
-        # Wait for the first task to complete
-        await run_task
+            # Wait for the first task to complete
+            await run_task
 
         print(f"Cancelling pending task...")
         monitor_task.cancel()
@@ -883,7 +1147,7 @@ class CharmCloudManager:
             ami_id,
             instance_types,
             cluster_name,
-            command,
+            commands,
             setup_command=None,
             total_target_capacity=3,
             on_demand_count=1,  # One on-demand, rest spot
@@ -897,7 +1161,7 @@ class CharmCloudManager:
             ami_id=ami_id,
             instance_types=instance_types,
             cluster_name=cluster_name,
-            command=command,
+            commands=commands,
             setup_command=setup_command,
             total_target_capacity=total_target_capacity,
             on_demand_count=on_demand_count,
